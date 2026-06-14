@@ -1,0 +1,23 @@
+body {
+    background-color:rgb(169, 237, 221);
+    margin: 0;
+}
+.GameTitle {
+    color: rgb(134, 213, 158);
+    font-family: Arial, sans-serif;
+    font-size: 48px;
+    margin: 20px 0;
+    text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
+
+.canvas-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+}
+
+#GameCanvas {
+    display: block;
+    border: 1px solid #333; /* Optional: adds a border to see the canvas */
+}
