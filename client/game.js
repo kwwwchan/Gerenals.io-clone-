@@ -11,11 +11,65 @@ let selectedCell = null; // Local visual tracking: { row, col }
 let myPlayerId = null;   // Stored player ID given by the server ('p1', 'p2', etc.)
 let gameWinner = null;
 
+// --- MOVE QUEUE -------------------------------------------------------------
+// Moves are not instant: the server only accepts one move per MOVE_DURATION_MS
+// per player. The player can still chain many moves locally — they are drawn as
+// a path of arrows — and they get dispatched to the server one at a time,
+// each after the previous one was acknowledged.
+const MOVE_DURATION_MS = 500;    // must match the server's cooldown
+const MOVE_SEND_BUFFER_MS = 60;  // extra pacing so we never arrive early
+const MAX_QUEUED_MOVES = 32;
+
+let moveQueue = [];      // moves waiting to be sent
+let pendingMove = null;  // move already sent, waiting for the server's ack
+let lastDispatchAt = 0;
+let dispatchTimer = null;
+
+function clearMoveQueue() {
+    moveQueue = [];
+    if (dispatchTimer !== null) {
+        clearTimeout(dispatchTimer);
+        dispatchTimer = null;
+    }
+    // pendingMove is already on the server — let its ack resolve normally
+}
+
+function pumpMoveQueue() {
+    if (dispatchTimer !== null || pendingMove || moveQueue.length === 0) return;
+
+    const earliest = lastDispatchAt + MOVE_DURATION_MS + MOVE_SEND_BUFFER_MS;
+    const wait = Math.max(0, earliest - Date.now());
+    dispatchTimer = setTimeout(() => {
+        dispatchTimer = null;
+        if (pendingMove || moveQueue.length === 0) return;
+        pendingMove = moveQueue.shift();
+        lastDispatchAt = Date.now();
+        socket.emit('requestMove', pendingMove);
+        draw(); // repaint so the in-flight step turns amber
+    }, wait);
+}
+
+function enqueueMove(fromRow, fromCol, toRow, toCol) {
+    // Mountains never accept armies — skip obviously illegal steps
+    if (map.grid[toRow][toCol].type === map.TYPE.MOUNTAIN) {
+        draw();
+        return;
+    }
+    if (moveQueue.length + (pendingMove ? 1 : 0) >= MAX_QUEUED_MOVES) return;
+
+    moveQueue.push({ fromRow, fromCol, toRow, toCol });
+    selectedCell = { row: toRow, col: toCol }; // the plan's tail becomes the new cursor
+    pumpMoveQueue();
+    draw();
+}
+
 // 1. Listen for the initial map setup data from the server
 socket.on('initMap', (data) => {
     map = data.gameMap;
     myPlayerId = data.playerID;
     gameWinner = null;
+    selectedCell = null;
+    clearMoveQueue();
     document.title = `Generals.io - Playing as ${myPlayerId || 'Spectator'}`;
     canvas.width = map.SIZE * CELL_SIZE;
     canvas.height = map.SIZE * CELL_SIZE;
@@ -30,6 +84,17 @@ socket.on('gameTick', (serverGrid) => {
     // Only draw if images have finished loading
     if (assetsReady)
         draw();
+});
+
+// 3. The server confirms every move request; only then do we send the next one
+socket.on('moveAck', (ack) => {
+    if (!pendingMove) return;
+    pendingMove = null;
+    if (ack && ack.accepted === false) {
+        lastDispatchAt = 0; // no move was consumed — the next one can go out now
+    }
+    pumpMoveQueue();
+    draw();
 });
 
 canvas.addEventListener('click', (event) => {
@@ -50,26 +115,21 @@ canvas.addEventListener('click', (event) => {
 
 function handleCellClick(row, col) {
     const clickedCell = map.grid[row][col];
-    
+
     if (selectedCell) {
         const dRow = Math.abs(selectedCell.row - row);
         const dCol = Math.abs(selectedCell.col - col);
-        
+
         // If clicking a directly adjacent tile (Up, Down, Left, Right)
         if ((dRow === 1 && dCol === 0) || (dRow === 0 && dCol === 1)) {
-            // DO NOT move armies locally. Shout our intent to the server instead!
-            socket.emit('requestMove', {
-                fromRow: selectedCell.row,
-                fromCol: selectedCell.col,
-                toRow: row,
-                toCol: col
-            });
-            selectedCell = { row,col }; //toCell is selected
-            draw();
+            // Queue the step; it will be dispatched to the server in order
+            enqueueMove(selectedCell.row, selectedCell.col, row, col);
             return;
         }
     }
-    
+
+    // Any other click picks a new source tile and abandons the planned path
+    clearMoveQueue();
     // Select tile only if it belongs to us and has movable armies (> 1)
     if (clickedCell.player.id === myPlayerId && clickedCell.value > 1) {
         selectedCell = { row, col };
@@ -80,8 +140,18 @@ function handleCellClick(row, col) {
 }
 
 window.addEventListener('keydown', (event) => {
-    // Only intercept keys if a map is loaded, an identity is known, and a cell is actively highlighted
-    if (!map || !selectedCell || !myPlayerId) return;
+    // Only intercept keys if a map is loaded and an identity is known
+    if (!map || !myPlayerId || gameWinner) return;
+
+    // Escape cancels the queued path and drops the selection
+    if (event.key === 'Escape') {
+        clearMoveQueue();
+        selectedCell = null;
+        draw();
+        return;
+    }
+
+    if (!selectedCell) return;
 
     let toRow = selectedCell.row;
     let toCol = selectedCell.col;
@@ -113,21 +183,8 @@ window.addEventListener('keydown', (event) => {
 
     // Map Boundary Guard Check
     if (toRow >= 0 && toRow < map.SIZE && toCol >= 0 && toCol < map.SIZE) {
-        
-        // 1. Send the movement directive up to the authoritative server
-        socket.emit('requestMove', {
-            fromRow: selectedCell.row,
-            fromCol: selectedCell.col,
-            toRow: toRow,
-            toCol: toCol
-        });
-
-        // 2. Secret Sauce: Shift your selection focus directly onto the targeted destination tile.
-        // This lets you tap "Right, Right, Down, Down" to fluidly navigate an entire army path!
-        selectedCell = { row: toRow, col: toCol };
-        
-        // 3. Immediately trigger a local redraw to update the selection box preview position
-        draw();
+        // Queue the step onto the plan; the dispatcher sends it to the server
+        enqueueMove(selectedCell.row, selectedCell.col, toRow, toCol);
     }
 });
 
@@ -221,6 +278,8 @@ function draw(){
                 drawCellValue(Math.abs(cell.value), x, y, CELL_SIZE);
         }
     }
+    // Draw the player's queued plan: one arrow per pending/queued step
+    drawMovePlan();
     if (selectedCell) {
         const x = selectedCell.col * CELL_SIZE;
         const y = selectedCell.row * CELL_SIZE;
@@ -238,6 +297,56 @@ function draw(){
     if (gameWinner) {
         drawWinScreen();
     }
+}
+
+// --- QUEUED MOVE OVERLAY ---
+function drawMovePlan() {
+    if (pendingMove) drawMoveArrow(pendingMove, true);
+    for (const move of moveQueue) drawMoveArrow(move, false);
+}
+
+function drawMoveArrow(move, isPending) {
+    const x1 = move.fromCol * CELL_SIZE + CELL_SIZE / 2;
+    const y1 = move.fromRow * CELL_SIZE + CELL_SIZE / 2;
+    const x2 = move.toCol * CELL_SIZE + CELL_SIZE / 2;
+    const y2 = move.toRow * CELL_SIZE + CELL_SIZE / 2;
+    // Moves are always orthogonal, so a sign is enough for the direction
+    const dx = Math.sign(x2 - x1);
+    const dy = Math.sign(y2 - y1);
+    const gap = 9;                 // keep the shaft clear of the cell centers
+    const sx = x1 + dx * gap, sy = y1 + dy * gap;
+    const ex = x2 - dx * (gap + 2), ey = y2 - dy * (gap + 2);
+
+    const color = isPending ? "#ffd54a" : "#ffffff"; // amber = in flight, white = queued
+
+    // Black underline first so the arrow reads on any cell color
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.65)";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+
+    // Arrowhead pointing into the destination cell
+    const head = 7;
+    const px = -dy, py = dx; // perpendicular axis
+    ctx.beginPath();
+    ctx.moveTo(ex + dx * head, ey + dy * head);
+    ctx.lineTo(ex + px * head * 0.6, ey + py * head * 0.6);
+    ctx.lineTo(ex - px * head * 0.6, ey - py * head * 0.6);
+    ctx.closePath();
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.65)";
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.fill();
 }
 
 function checkVisibility(row, col) {

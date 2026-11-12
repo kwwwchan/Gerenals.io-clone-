@@ -5,12 +5,21 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, {
+    cors: {
+        origin: process.env.FRONTEND_URL || '*',
+        methods: ['GET', 'POST']
+    }
+});
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 // Serve all your static client files (index.html, game.js, style.css, cell-image/)
 app.use(express.static(path.join(__dirname, '../client')));
+
+server.listen(PORT,'0.0.0.0', () => {
+    console.log(`Server is running smoothly on ${PORT}`);
+});
 
 const PLAYERS = {
     NONE: { id: null, name: 'Empty', color: '#bfd6dc' },
@@ -24,6 +33,10 @@ const TYPE = {
     TOWER: "tower",
     MOUNTAIN: "mountain",
 }
+// A move takes time: each player may execute at most one move per interval
+const MOVE_DURATION_MS = 500;
+// Tolerance for network jitter when enforcing the cooldown
+const MOVE_COOLDOWN_SLACK_MS = 100;
 const gameMap = createMap();
 let tickCount = 0;
 
@@ -56,46 +69,56 @@ const activeConnections = {};
 io.on('connection', (socket) => {
     console.log('A player connected: ' + socket.id);
 
-    let assignedPlayer = PLAYERS.NONE;
-    const currentOccupants = Object.keys(activeConnections).length;
+    // Hand out the first free seat (P1/P2); everyone else is a spectator
+    const usedIds = new Set(Object.values(activeConnections).map((e) => e.player.id));
+    const assignedPlayer =
+        [PLAYERS.PLAYER1, PLAYERS.PLAYER2].find((p) => !usedIds.has(p.id)) || PLAYERS.NONE;
     
-    if (currentOccupants === 0) assignedPlayer = PLAYERS.PLAYER1;     
-    else if (currentOccupants === 1) assignedPlayer = PLAYERS.PLAYER2;
-    else assignedPlayer = PLAYERS.NONE;
-
-    activeConnections[socket.id] = assignedPlayer;
+    activeConnections[socket.id] = { player: assignedPlayer, lastMoveAt: 0 };
 
     // Immediately send the structural map info (size, types) to the newly connected player
     socket.emit('initMap', {gameMap, playerID: assignedPlayer.id});
 
     socket.on('requestMove', (data) => {
-        const playerProfile = activeConnections[socket.id];
-        
+        const entry = activeConnections[socket.id];
+        const playerProfile = entry ? entry.player : null;
+
+        // Every request gets an ack so the client queue never stalls
+        const reject = () => socket.emit('moveAck', { accepted: false });
+
         // Spectators cannot issue movement commands
-        if (!playerProfile || playerProfile.id === null) return;
+        if (!playerProfile || playerProfile.id === null) return reject();
 
         const { fromRow, fromCol, toRow, toCol } = data;
 
+        // Security Layer 0: input shape + move cooldown (moving takes time)
+        if (![fromRow, fromCol, toRow, toCol].every((v) => Number.isInteger(v))) return reject();
+        const now = Date.now();
+        if (now - entry.lastMoveAt < MOVE_DURATION_MS - MOVE_COOLDOWN_SLACK_MS) return reject();
+
         // Security Layer 1: Boundary Verification
         if (fromRow < 0 || fromRow >= gameMap.SIZE || fromCol < 0 || fromCol >= gameMap.SIZE ||
-            toRow < 0 || toRow >= gameMap.SIZE || toCol < 0 || toCol >= gameMap.SIZE) return;
+            toRow < 0 || toRow >= gameMap.SIZE || toCol < 0 || toCol >= gameMap.SIZE) return reject();
 
         const fromCell = gameMap.grid[fromRow][fromCol];
         const toCell = gameMap.grid[toRow][toCol];
 
         // Security Layer 2: Ownership validation and structural army check
-        if (fromCell.player.id !== playerProfile.id || fromCell.value <= 1) return;
+        if (fromCell.player.id !== playerProfile.id || fromCell.value <= 1) return reject();
 
         // Security Layer 3: Verification of Adjacency
         const dRow = Math.abs(fromRow - toRow);
         const dCol = Math.abs(fromCol - toCol);
-        if (!((dRow === 1 && dCol === 0) || (dRow === 0 && dCol === 1))) return;
+        if (!((dRow === 1 && dCol === 0) || (dRow === 0 && dCol === 1))) return reject();
 
         // Security Layer 4: Mountain Restriction
-        if (toCell.type === TYPE.MOUNTAIN) return;
+        if (toCell.type === TYPE.MOUNTAIN) return reject();
+
+        // The move is happening: start this player's cooldown
+        entry.lastMoveAt = now;
 
         // Execute troop movement safely on backend
-        let armyToMove = fromCell.value - 1; 
+        let armyToMove = fromCell.value - 1;
         fromCell.value = 1;
 
         if (toCell.player.id === playerProfile.id) {
@@ -107,7 +130,7 @@ io.on('connection', (socket) => {
             if (targetStrength <= 0){
                 toCell.value += armyToMove;
                 if (toCell.value > 0)
-                    toCell.player = playerProfile; 
+                    toCell.player = playerProfile;
             }
             // Battle resolution
             else if (armyToMove > targetStrength) {
@@ -122,14 +145,12 @@ io.on('connection', (socket) => {
         }
         // Instantly shout state mutation changes out to everyone to minimize display delay
         io.emit('gameTick', gameMap.grid);
+        socket.emit('moveAck', { accepted: true });
     });
     socket.on('disconnect', () => {
         console.log('Player disconnected: ' + socket.id);
+        delete activeConnections[socket.id]; // free the seat for the next player
     });
-});
-
-server.listen(PORT, () => {
-    console.log(`Server is running smoothly on http://localhost:${PORT}`);
 });
 
 function createMap(){
