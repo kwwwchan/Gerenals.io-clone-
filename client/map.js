@@ -17,7 +17,6 @@ function createMap(){
     function cell(type,player,value = 0){
         return {type,player,value};
     }
-
     for(let row = 0;row < SIZE;row++){
         grid[row] = [];
         for (let col = 0;col < SIZE;col++){
