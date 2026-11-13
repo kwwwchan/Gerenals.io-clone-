@@ -3,7 +3,18 @@
 A real-time, multiplayer grid-based strategy game clone inspired by generals.io. The project features an authoritative Node.js server to coordinate mechanics, manage game loops, and handle battle resolution, combined with a lightweight HTML5 Canvas client interface.
 
 ---
+## 🎮 Play the Game (Live Demo)
 
+**👉 [Click here to play](https://gerenals-io-clone.onrender.com)** 
+*(Note: Hosted on Render's free tier. The server sleeps after 15 minutes of inactivity. If the page takes up to 1 minute to load, please wait patiently while the server wakes up!)*
+
+### 🕹️ How to Play
+* **The Objective:** Locate and conquer the enemy's home `BASE` while defending your own.
+* **Selection:** `Left-Click` on any tile you own containing more than 1 troop.
+* **Movement:** Use `Arrow Keys` or `W`, `A`, `S`, `D` to command your army into an adjacent space. The selection box automatically updates to your target tile, allowing you to rapidly chain multi-tile pathways.
+* **Multiplayer:** Open a second browser tab (or send the link to a friend) to join as Player 2. A third connection will automatically become a spectator.
+
+---
 ## 🚀 Features
 
 * **Real-Time Multiplayer:** Full bidirectional state synchronization powered by Socket.io.
